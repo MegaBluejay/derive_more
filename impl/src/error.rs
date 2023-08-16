@@ -1,6 +1,12 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{spanned::Spanned as _, Error, Result};
+use syn::{
+    meta::ParseNestedMeta,
+    parenthesized,
+    parse::{Parse, ParseStream},
+    spanned::Spanned as _,
+    Error, Result,
+};
 
 use crate::utils::{
     self, AttrParams, DeriveType, FullMetaInfo, HashSet, MetaInfo, MultiFieldData,
@@ -88,6 +94,151 @@ pub fn expand(
     };
 
     Ok(render)
+}
+
+#[derive(Default)]
+struct FieldAttribute {
+    source: Option<bool>,
+    backtrace: Option<bool>,
+}
+
+fn parse_attr_arg(
+    ident: &str,
+    value: bool,
+    meta: &ParseNestedMeta,
+    arg: &mut Option<bool>,
+) -> Option<syn::Result<()>> {
+    if !meta.path.is_ident(ident) {
+        return None;
+    }
+
+    Some(if arg.replace(value).is_some() {
+        Err(meta.error(format!(
+            "multiple `{ident}`/`not({ident})` arguments not allowed"
+        )))
+    } else {
+        Ok(())
+    })
+}
+
+fn parse_attr_args(
+    value: bool,
+    meta: &ParseNestedMeta,
+    attr: &mut FieldAttribute,
+) -> Option<syn::Result<()>> {
+    if let Some(res) = parse_attr_arg("source", value, meta, &mut attr.source) {
+        return Some(res);
+    }
+
+    if let Some(res) = parse_attr_arg("backtrace", value, meta, &mut attr.backtrace) {
+        return Some(res);
+    }
+
+    None
+}
+
+impl FieldAttribute {
+    fn parse_attrs(attrs: impl AsRef<[syn::Attribute]>) -> syn::Result<Option<Self>> {
+        attrs
+            .as_ref()
+            .iter()
+            .filter(|attr| attr.path().is_ident("error"))
+            .try_fold(None, |mut attrs, attr| {
+                let field_attr = Self::parse_attr(attr)?;
+
+                if attrs.replace(field_attr).is_some() {
+                    Err(syn::Error::new(
+                        attr.path().span(),
+                        "only single `#[error(...)]` attribute allowed here",
+                    ))
+                } else {
+                    Ok(attrs)
+                }
+            })
+    }
+
+    fn parse_attr(attr: &syn::Attribute) -> syn::Result<Self> {
+        let mut field_attr = FieldAttribute::default();
+        let mut ignore = false;
+
+        attr.parse_nested_meta(|meta| {
+            if ignore {
+                return Err(meta.error("`ignore` cannot be used together with other arguments"));
+            }
+
+            if meta.path.is_ident("ignore") {
+                ignore = true;
+                return Ok(());
+            }
+
+            if let Some(res) = parse_attr_args(true, &meta, &mut field_attr) {
+                return res;
+            }
+
+            if meta.path.is_ident("not") {
+                meta.parse_nested_meta(|meta| {
+                    if let Some(res) = parse_attr_args(false, &meta, &mut field_attr) {
+                        return res;
+                    }
+
+                    Err(meta.error("unknown argument, only `source`/`backtrace` allowed"))
+                })?;
+
+                return Ok(());
+            }
+
+            Err(meta.error("unknown argument, only `ignore`/`source`/`backtrace`/`not(source)`/`not(backtrace)` allowed"))
+        })?;
+
+        if field_attr.source.is_none() && field_attr.backtrace.is_none() && !ignore {
+            Err(syn::Error::new(
+                attr.path().span(),
+                "empty attribute not allowed",
+            ))
+        } else {
+            Ok(field_attr)
+        }
+    }
+}
+
+enum VariantAttribute {
+    Ignore,
+}
+
+impl VariantAttribute {
+    fn parse_attrs(attrs: impl AsRef<[syn::Attribute]>) -> syn::Result<Option<Self>> {
+        attrs
+            .as_ref()
+            .iter()
+            .filter(|attr| attr.path().is_ident("error"))
+            .try_fold(None, |mut attrs, attr| {
+                let variant_attr = attr.parse_args()?;
+
+                if attrs.replace(variant_attr).is_some() {
+                    Err(syn::Error::new(
+                        attr.path().span(),
+                        "only single `#[error(...)]` attribute allowed here",
+                    ))
+                } else {
+                    Ok(attrs)
+                }
+            })
+    }
+}
+
+impl Parse for VariantAttribute {
+    fn parse(input: ParseStream) -> Result<Self> {
+        input.parse::<syn::Path>().and_then(|p| {
+            if p.is_ident("ignore") {
+                return Ok(Self::Ignore);
+            }
+
+            Err(syn::Error::new(
+                p.span(),
+                "unknown argument, only `ignore` allowed",
+            ))
+        })
+    }
 }
 
 fn render_struct(
